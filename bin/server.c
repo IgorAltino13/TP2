@@ -1,3 +1,4 @@
+// === SERVIDOR ===
 #include "common.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -5,250 +6,299 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <math.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <time.h>
 
 #define BUFSZ 1024
-#define MAX_CLIENTS 10
+#define max_jogadores 4
 
-static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-volatile float current_multiplier = 1.00f;
-
-typedef struct {
-    int csock;
-    struct sockaddr_storage storage;
-    int player_id;
-    float bet;
-    float profit;
-    int has_bet;
-    int has_cashout;
-    int active;
-} client_data_t;
-
-client_data_t *clients[MAX_CLIENTS] = {0};
-float house_profit = 0.0f;
-int next_id = 1;
-
-void broadcast(struct aviator_msg *msg) {
-    pthread_mutex_lock(&lock);
-    for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (clients[i] && clients[i]->active) {
-            send(clients[i]->csock, msg, sizeof(*msg), 0);
-        }
-    }
-    pthread_mutex_unlock(&lock);
-}
-
-void reset_bets() {
-    pthread_mutex_lock(&lock);
-    for (int i = 0; i < MAX_CLIENTS; ++i) {
-        if (clients[i]) {
-            clients[i]->bet = 0;
-            clients[i]->has_bet = 0;
-            clients[i]->has_cashout = 0;
-        }
-    }
-    pthread_mutex_unlock(&lock);
-}
-
-void *game_loop(void *arg) {
-    while (1) {
-        // Espera por pelo menos um jogador ativo
-        int has_players = 0;
-        do {
-            pthread_mutex_lock(&lock);
-            for (int i = 0; i < MAX_CLIENTS; ++i) {
-                if (clients[i] && clients[i]->active) {
-                    has_players = 1;
-                    break;
-                }
-            }
-            pthread_mutex_unlock(&lock);
-            if (!has_players) sleep(1);
-        } while (!has_players);
-
-        struct aviator_msg start_msg = {.player_id = 0};
-        strncpy(start_msg.type, "start", STR_LEN);
-        broadcast(&start_msg);
-        printf("event=start | id=* | N=*\n");
-        sleep(10);  // Janela de apostas
-
-        // Fecha apostas e calcula N e V
-        int N = 0;
-        float V = 0.0f;
-        pthread_mutex_lock(&lock);
-        for (int i = 0; i < MAX_CLIENTS; ++i) {
-            if (clients[i] && clients[i]->active && clients[i]->has_bet) {
-                N++;
-                V += clients[i]->bet;
-            }
-        }
-        pthread_mutex_unlock(&lock);
-
-        struct aviator_msg closed_msg = {.player_id = 0};
-        strncpy(closed_msg.type, "closed", STR_LEN);
-        broadcast(&closed_msg);
-        printf("event=closed | id=* | N=%d | V=%.2f\n", N, V);
-
-        if (N == 0) {
-            reset_bets();
-            continue;
-        }
-
-        float me = sqrtf(1.0f + N + 0.01f * V);
-        float m = 1.00f;
-
-        while (m < me) {
-            current_multiplier = m;
-
-            struct aviator_msg mult_msg = {.player_id = 0, .value = m};
-            strncpy(mult_msg.type, "multiplier", STR_LEN);
-            broadcast(&mult_msg);
-            printf("event=multiplier | id=* | m=%.2f\n", m);
-            usleep(100000);  // 100ms
-            m += 0.01f;
-        }
-
-        // Explodir
-        current_multiplier = me;
-        struct aviator_msg explode_msg = {.player_id = 0, .value = me};
-        strncpy(explode_msg.type, "explode", STR_LEN);
-        broadcast(&explode_msg);
-        printf("event=explode | id=* | m=%.2f\n", me);
-
-        pthread_mutex_lock(&lock);
-        for (int i = 0; i < MAX_CLIENTS; ++i) {
-            if (clients[i] && clients[i]->active && clients[i]->has_bet && !clients[i]->has_cashout) {
-                clients[i]->profit -= clients[i]->bet;
-                house_profit += clients[i]->bet;
-
-                struct aviator_msg profit_msg = {
-                    .player_id = clients[i]->player_id,
-                    .player_profit = clients[i]->profit,
-                    .house_profit = house_profit
-                };
-                strncpy(profit_msg.type, "profit", STR_LEN);
-                send(clients[i]->csock, &profit_msg, sizeof(profit_msg), 0);
-
-                printf("event=explode | id=%d | m=%.2f\n", clients[i]->player_id, me);
-                printf("event=profit | id=%d | player_profit=%.2f\n", clients[i]->player_id, clients[i]->profit);
-            }
-        }
-        printf("event=profit | id=* | house_profit=%.2f\n", house_profit);
-        pthread_mutex_unlock(&lock);
-
-        reset_bets();
-    }
-    return NULL;
-}
-
-void *client_thread(void *data) {
-    client_data_t *c = (client_data_t *)data;
-    char caddrstr[BUFSZ];
-    addrtostr((struct sockaddr *)(&c->storage), caddrstr, BUFSZ);
-    printf("[log] connection from %s\n", caddrstr);
-
-    while (1) {
-        struct aviator_msg msg = {0};
-        int count = recv(c->csock, &msg, sizeof(msg), 0);
-        if (count <= 0) break;
-
-        pthread_mutex_lock(&lock);
-        if (strncmp(msg.type, "bet", STR_LEN) == 0 && !c->has_bet && msg.value > 0) {
-            c->bet = msg.value;
-            c->has_bet = 1;
-            printf("event=bet | id=%d | bet=%.2f\n", c->player_id, c->bet);
-        } else if (strncmp(msg.type, "cashout", STR_LEN) == 0 && !c->has_cashout && c->has_bet) {
-            float payout = c->bet * current_multiplier;
-            c->profit += payout - c->bet;
-            house_profit -= payout - c->bet;
-            c->has_cashout = 1;
-
-            struct aviator_msg payout_msg = {
-                .player_id = c->player_id,
-                .value = payout,
-                .player_profit = c->profit
-            };
-            strncpy(payout_msg.type, "payout", STR_LEN);
-            send(c->csock, &payout_msg, sizeof(payout_msg), 0);
-
-            struct aviator_msg prof_msg = payout_msg;
-            strncpy(prof_msg.type, "profit", STR_LEN);
-            prof_msg.house_profit = house_profit;
-            send(c->csock, &prof_msg, sizeof(prof_msg), 0);
-
-            printf("event=cashout | id=%d | m=%.2f\n", c->player_id, current_multiplier);
-            printf("event=payout | id=%d | payout=%.2f\n", c->player_id, payout);
-            printf("event=profit | id=%d | player_profit=%.2f\n", c->player_id, c->profit);
-        } else if (strncmp(msg.type, "bye", STR_LEN) == 0) {
-            pthread_mutex_unlock(&lock);
-            break;
-        }
-        pthread_mutex_unlock(&lock);
-    }
-
-    close(c->csock);
-    pthread_mutex_lock(&lock);
-    printf("event=bye | id=%d\n", c->player_id);
-    c->active = 0;
-    pthread_mutex_unlock(&lock);
-    free(c);
-    pthread_exit(NULL);
-}
-
-void usage() {
-    printf("Usage: ./server <v4|v6> <port>\n");
+void usage(int argc, char **argv){
+    printf("usage: %s <v4|v6> <server port>\n", argv[0]);
     exit(EXIT_FAILURE);
 }
 
-int main(int argc, char **argv) {
-    if (argc != 3) usage();
-
+struct client_data {
+    int csock;
     struct sockaddr_storage storage;
-    if (server_sockaddr_init(argv[1], argv[2], &storage) != 0) usage();
+    int slot;
+};
 
-    int s = socket(storage.ss_family, SOCK_STREAM, 0);
-    if (s < 0) logexit("socket");
+struct jogadores {
+    int id_jogador;
+    float valor_aposta;
+    float lucro_jogador;
+    int apostou;
+    int cash;
+    int csock;
+};
 
-    int optval = 1;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-    if (bind(s, (struct sockaddr *)(&storage), sizeof(storage)) != 0) logexit("bind");
-    if (listen(s, MAX_CLIENTS) != 0) logexit("listen");
+struct jogadores jogador[max_jogadores];
+pthread_mutex_t controle_jogador = PTHREAD_MUTEX_INITIALIZER;
+int proximo_jogador_id = 1;
+int num_jogadores_conectados = 0;
 
-    pthread_t game_tid;
-    pthread_create(&game_tid, NULL, game_loop, NULL);
+enum estado_rodada {
+    AGUARDANDO_JOGADORES,
+    APOSTAS_ABERTAS,
+    APOSTAS_FECHADAS,
+    EM_VOO
+};
+
+enum estado_rodada estado_atual = AGUARDANDO_JOGADORES;
+float segundos_restantes = 0.0f;
+float multiplicador_atual = 1.0f;
+float lucro_total_casa = 0.0f;
+
+void enviar_msg_para_todos(struct aviator_msg *msg){
+    pthread_mutex_lock(&controle_jogador);
+    for (int i = 0; i < max_jogadores; i++){
+        if (jogador[i].csock != -1){
+            
+            send(jogador[i].csock, msg, sizeof(*msg), 0);
+        }
+    }
+    pthread_mutex_unlock(&controle_jogador);
+}
+
+void *thread_voo(void *arg) {
+    pthread_mutex_lock(&controle_jogador);
+    estado_atual = EM_VOO;
+    pthread_mutex_unlock(&controle_jogador);
+
+    float m = 1.0f;
+    int N = 0;
+    float V = 0.0f;
+
+    pthread_mutex_lock(&controle_jogador);
+    for (int i = 0; i < max_jogadores; i++) {
+        if (jogador[i].csock != -1 && jogador[i].apostou) {
+            N++;
+            V += jogador[i].valor_aposta;
+        }
+    }
+    pthread_mutex_unlock(&controle_jogador);
+
+    float m_e = sqrtf(1.0f + N + 0.01f * V);
+
+    struct aviator_msg msg;
+    memset(&msg, 0, sizeof(msg));
+    strncpy(msg.type, "multiplier", STR_LEN);
+
+    printf("[log] Iniciando voo. Explosão ocorrerá em m = %.2f\n", m_e);
+
+    while (m < m_e) {
+        usleep(100000);
+        m *= 1.01f;
+        multiplicador_atual = m;
+
+        msg.value = m;
+        strncpy(msg.type, "multiplier", STR_LEN);
+        enviar_msg_para_todos(&msg);
+    }
+
+    // Atualiza lucro da casa com apostas perdidas
+    pthread_mutex_lock(&controle_jogador);
+    for (int i = 0; i < max_jogadores; i++) {
+        if (jogador[i].csock != -1 && jogador[i].apostou && !jogador[i].cash) {
+            lucro_total_casa += jogador[i].valor_aposta;
+        }
+    }
+    pthread_mutex_unlock(&controle_jogador);
+
+    memset(&msg, 0, sizeof(msg));
+    strncpy(msg.type, "explode", STR_LEN);
+    msg.value = m_e;
+    msg.house_profit = lucro_total_casa;
+    enviar_msg_para_todos(&msg);
+
+    printf("[log] Avião explodiu em m = %.2f. Mensagem 'explode' enviada.\n", m_e);
+
+    pthread_mutex_lock(&controle_jogador);
+    estado_atual = AGUARDANDO_JOGADORES;
+    pthread_mutex_unlock(&controle_jogador);
+
+    pthread_exit(NULL);
+}
+
+void *thread_countdown(void *arg) {
+    for (int i = 10; i > 0; i--) {
+        pthread_mutex_lock(&controle_jogador);
+        segundos_restantes = i;
+        pthread_mutex_unlock(&controle_jogador);
+        sleep(1);
+    }
+
+    pthread_mutex_lock(&controle_jogador);
+    estado_atual = APOSTAS_FECHADAS;
+    segundos_restantes = 0.0f;
+    pthread_mutex_unlock(&controle_jogador);
+
+    struct aviator_msg msg;
+    memset(&msg, 0, sizeof(msg));
+    strncpy(msg.type, "closed", STR_LEN);
+    enviar_msg_para_todos(&msg);
+    printf("[log] Apostas encerradas. Mensagem 'closed' enviada.\n");
+
+    pthread_t tid_voo;
+    pthread_create(&tid_voo, NULL, thread_voo, NULL);
+    pthread_detach(tid_voo);
+
+    pthread_exit(NULL);
+}
+
+void *client_thread(void *data){
+    struct client_data *cdata = (struct client_data *)data;
+    int slot = cdata->slot;
+    struct sockaddr *caddr = (struct sockaddr *)(&cdata->storage);
+    char caddrstr[BUFSZ];
+    addrtostr(caddr, caddrstr, BUFSZ);
+    printf("[log] connection from %s\n", caddrstr);
 
     while (1) {
-        struct sockaddr_storage cstorage;
-        socklen_t caddrlen = sizeof(cstorage);
-        int csock = accept(s, (struct sockaddr *)(&cstorage), &caddrlen);
-        if (csock < 0) continue;
+        struct aviator_msg msg;
+        ssize_t count = recv(cdata->csock, &msg, sizeof(msg), 0);
+        if (count <= 0) break;
 
-        client_data_t *c = malloc(sizeof(client_data_t));
-        c->csock = csock;
-        memcpy(&c->storage, &cstorage, sizeof(cstorage));
+        pthread_mutex_lock(&controle_jogador);
 
-        pthread_mutex_lock(&lock);
-        c->player_id = next_id++;
-        c->bet = 0;
-        c->profit = 0;
-        c->has_bet = 0;
-        c->has_cashout = 0;
-        c->active = 1;
-
-        for (int i = 0; i < MAX_CLIENTS; i++) {
-            if (!clients[i]) {
-                clients[i] = c;
-                break;
+        if (strncmp(msg.type, "bet", STR_LEN) == 0) {
+            if (estado_atual != APOSTAS_ABERTAS) {
+                printf("[log] Aposta rejeitada: fora do tempo permitido.\n");
+            } else if (jogador[slot].apostou) {
+                printf("[log] Jogador %d já apostou nesta rodada.\n", jogador[slot].id_jogador);
+            } else {
+                jogador[slot].valor_aposta = msg.value;
+                jogador[slot].apostou = 1;
+                jogador[slot].cash = 0;
+                printf("[log] Aposta recebida de jogador %d: R$ %.2f\n",
+                       jogador[slot].id_jogador, msg.value);
             }
         }
-        pthread_mutex_unlock(&lock);
+
+        else if (strncmp(msg.type, "cashout", STR_LEN) == 0) {
+            if (estado_atual == EM_VOO && jogador[slot].apostou && !jogador[slot].cash) {
+                jogador[slot].cash = 1;
+                float payout = jogador[slot].valor_aposta * multiplicador_atual;
+                jogador[slot].lucro_jogador = payout - jogador[slot].valor_aposta;
+                lucro_total_casa  = lucro_total_casa - (payout - jogador[slot].valor_aposta);
+
+                memset(&msg, 0, sizeof(msg));
+                strncpy(msg.type, "payout", STR_LEN);
+                msg.value = payout;
+                send(jogador[slot].csock, &msg, sizeof(msg), 0);
+
+                memset(&msg, 0, sizeof(msg));
+                strncpy(msg.type, "profit", STR_LEN);
+                msg.player_profit = jogador[slot].lucro_jogador;
+                send(jogador[slot].csock, &msg, sizeof(msg), 0);
+
+                printf("[log] Jogador %d sacou com m = %.2f, payout = %.2f\n",
+                    jogador[slot].id_jogador, multiplicador_atual, payout);
+            }
+        }
+
+        pthread_mutex_unlock(&controle_jogador);
+    }
+
+    pthread_mutex_lock(&controle_jogador);
+    jogador[slot].csock = -1;
+    num_jogadores_conectados--;
+    pthread_mutex_unlock(&controle_jogador);
+
+    close(cdata->csock);
+    free(cdata);
+    pthread_exit(EXIT_SUCCESS);
+}
+
+int main(int argc, char **argv){
+    if (argc < 3) usage(argc, argv);
+
+    srand(time(NULL));
+    memset(jogador, 0, sizeof(jogador));
+    for (int i = 0; i < max_jogadores; i++) jogador[i].csock = -1;
+
+    struct sockaddr_storage storage;
+    if (0 != server_sockaddr_init(argv[1], argv[2], &storage)) usage(argc, argv);
+
+    int s = socket(storage.ss_family, SOCK_STREAM, 0);
+    if (s == -1) logexit("socket");
+
+    int enable = 1;
+    if (0 != setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int))) logexit("setsockopt");
+
+    struct sockaddr *addr = (struct sockaddr *)(&storage);
+    if (0 != bind(s, addr, sizeof(storage))) logexit("bind");
+    if (0 != listen(s, 10)) logexit("listen");
+
+    char addrstr[BUFSZ];
+    addrtostr(addr, addrstr, BUFSZ);
+    printf("bound to %s, waiting connections...\n", addrstr);
+
+    while (1){
+        struct sockaddr_storage cstorage;
+        struct sockaddr *caddr = (struct sockaddr *)(&cstorage);
+        socklen_t caddrlen = sizeof(cstorage);
+        int csock = accept(s, caddr, &caddrlen);
+        if (csock == -1) logexit("accept");
+
+        pthread_mutex_lock(&controle_jogador);
+        int aux = -1;
+        for (int i = 0; i < max_jogadores; i++){
+            if (jogador[i].csock == -1){ aux = i; break; }
+        }
+        if (aux == -1){
+            pthread_mutex_unlock(&controle_jogador);
+            printf("[log] Máximo de jogadores atingido\n");
+            close(csock);
+            continue;
+        }
+
+        jogador[aux].csock = csock;
+        jogador[aux].id_jogador = proximo_jogador_id++;
+        jogador[aux].apostou = 0;
+        jogador[aux].cash = 0;
+        jogador[aux].lucro_jogador = 0.0f;
+        jogador[aux].valor_aposta = 0.0f;
+        num_jogadores_conectados++;
+
+        struct aviator_msg msg;
+        memset(&msg, 0, sizeof(msg));
+        if (estado_atual == APOSTAS_ABERTAS) {
+            strncpy(msg.type, "start", STR_LEN);
+            msg.value = segundos_restantes > 0 ? segundos_restantes : 10.0f;
+            send(csock, &msg, sizeof(msg), 0);
+        } else if (estado_atual == APOSTAS_FECHADAS || estado_atual == EM_VOO) {
+            strncpy(msg.type, "closed", STR_LEN);
+            msg.value = 0.0f;
+            send(csock, &msg, sizeof(msg), 0);
+        }
+        pthread_mutex_unlock(&controle_jogador);
+
+        if (estado_atual == AGUARDANDO_JOGADORES && num_jogadores_conectados >= 1){
+            estado_atual = APOSTAS_ABERTAS;
+            segundos_restantes = 30.0f;
+            memset(&msg, 0, sizeof(msg));
+            strncpy(msg.type, "start", STR_LEN);
+            msg.value = segundos_restantes;
+            enviar_msg_para_todos(&msg);
+            printf("[log] Rodada iniciada. Enviando start a todos.\n");
+
+            pthread_t tid_countdown;
+            pthread_create(&tid_countdown, NULL, thread_countdown, NULL);
+            pthread_detach(tid_countdown);
+        }
+
+        struct client_data *cdata = malloc(sizeof(*cdata));
+        if (!cdata) logexit("malloc");
+        cdata->csock = csock;
+        memcpy(&(cdata->storage), &cstorage, sizeof(cstorage));
+        cdata->slot = aux;
 
         pthread_t tid;
-        pthread_create(&tid, NULL, client_thread, c);
+        pthread_create(&tid, NULL, client_thread, cdata);
         pthread_detach(tid);
     }
 
-    return 0;
+    exit(EXIT_SUCCESS);
 }
