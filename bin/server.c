@@ -1,4 +1,4 @@
-// === SERVIDOR ===
+/* ---------- server.c (versão final) ---------- */
 #include "common.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,296 +9,384 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <errno.h>
 
-#define BUFSZ 1024
-#define max_jogadores 4
+#define BUFSZ           1024
+#define MAX_JOGADORES   10
 
-void usage(int argc, char **argv){
-    printf("usage: %s <v4|v6> <server port>\n", argv[0]);
-    exit(EXIT_FAILURE);
-}
+/* ---------- Protótipos ---------- */
+void *thread_countdown(void *);
+void *thread_voo(void *);
+void *thread_teclado(void *);
+void  iniciar_nova_rodada(void);
+void  encerrar_threads_rodada(void);
+void  enviar_msg_para_todos(struct aviator_msg *);
+void  shutdown_servidor(void);
+void  usage(int, char **);
 
+/* ---------- Estruturas ---------- */
 struct client_data {
     int csock;
     struct sockaddr_storage storage;
     int slot;
 };
 
-struct jogadores {
-    int id_jogador;
-    float valor_aposta;
-    float lucro_jogador;
-    int apostou;
-    int cash;
-    int csock;
+struct jogador_t {
+    int    id;
+    double valor_aposta;
+    double lucro;
+    int    apostou;
+    int    sacou;
+    int    csock;
 };
+static struct jogador_t jogador[MAX_JOGADORES];
 
-struct jogadores jogador[max_jogadores];
-pthread_mutex_t controle_jogador = PTHREAD_MUTEX_INITIALIZER;
-int proximo_jogador_id = 1;
-int num_jogadores_conectados = 0;
+/* ---------- Variáveis globais ---------- */
+static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+static int proximo_id      = 1;
+static int num_jogadores   = 0;
 
-enum estado_rodada {
-    AGUARDANDO_JOGADORES,
-    APOSTAS_ABERTAS,
-    APOSTAS_FECHADAS,
-    EM_VOO
-};
+enum estado_rodada { AGUARDANDO, APOSTAS_ABERTAS, APOSTAS_FECHADAS, EM_VOO };
+static enum estado_rodada estado = AGUARDANDO;
 
-enum estado_rodada estado_atual = AGUARDANDO_JOGADORES;
-float segundos_restantes = 0.0f;
-float multiplicador_atual = 1.0f;
-float lucro_total_casa = 0.0f;
+static double seg_restantes    = 0.0;
+static double mult_atual       = 1.0;
+static double lucro_casa       = 0.0;
 
-void enviar_msg_para_todos(struct aviator_msg *msg){
-    pthread_mutex_lock(&controle_jogador);
-    for (int i = 0; i < max_jogadores; i++){
-        if (jogador[i].csock != -1){
-            
-            send(jogador[i].csock, msg, sizeof(*msg), 0);
-        }
-    }
-    pthread_mutex_unlock(&controle_jogador);
+/* Threads internas */
+static pthread_t tid_countdown, tid_voo, tid_teclado;
+static int countdown_ativo = 0, voo_ativo = 0;
+
+/* Socket de escuta global para fechar no shutdown */
+static int sock_listen;
+
+/* ---------- Utilidades ---------- */
+void usage(int argc, char **argv) {
+    fprintf(stderr, "usage: %s <v4|v6> <server port>\n", argv[0]);
+    exit(EXIT_FAILURE);
 }
 
+void enviar_msg_para_todos(struct aviator_msg *msg) {
+    for (int i = 0; i < MAX_JOGADORES; i++)
+        if (jogador[i].csock != -1)
+            send(jogador[i].csock, msg, sizeof(*msg), 0);
+}
+
+void resetar_apostas(void) {
+    for (int i = 0; i < MAX_JOGADORES; i++) {
+        jogador[i].apostou = jogador[i].sacou = 0;
+        jogador[i].valor_aposta = 0.0;
+    }
+}
+
+void encerrar_threads_rodada(void) {
+    if (countdown_ativo) {
+        pthread_cancel(tid_countdown);
+        pthread_join(tid_countdown, NULL);
+        countdown_ativo = 0;
+    }
+    if (voo_ativo) {
+        pthread_cancel(tid_voo);
+        pthread_join(tid_voo, NULL);
+        voo_ativo = 0;
+    }
+    estado = AGUARDANDO;
+}
+
+/* ---------- Shutdown global ---------- */
+void shutdown_servidor(void) {
+    pthread_mutex_lock(&mtx);
+
+    /* avisa clientes */
+    struct aviator_msg bye = {0};
+    strncpy(bye.type, "bye", STR_LEN);
+    enviar_msg_para_todos(&bye);
+    printf("event=bye | id=*\n");
+    printf("Encerrando servidor.\n");
+
+    /* fecha sockets de clientes */
+    for (int i = 0; i < MAX_JOGADORES; i++)
+        if (jogador[i].csock != -1) {
+            close(jogador[i].csock);
+            jogador[i].csock = -1;
+        }
+
+    /* cancela threads de rodada */
+    encerrar_threads_rodada();
+
+    /* fecha socket de escuta para desbloquear accept() */
+    close(sock_listen);
+
+    pthread_mutex_unlock(&mtx);
+
+    /* termina processo */
+    exit(EXIT_SUCCESS);
+}
+
+/* ---------- Thread de leitura do teclado ---------- */
+void *thread_teclado(void *arg) {
+    (void)arg;
+    int ch;
+    while ((ch = getchar()) != EOF) {
+        if (ch == 'Q' || ch == 'q')
+            shutdown_servidor();
+    }
+    return NULL;
+}
+
+/* ---------- Thread countdown ---------- */
+void *thread_countdown(void *arg) {
+    (void)arg;
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+
+    for (int i = 10; i > 0; i--) {
+        pthread_mutex_lock(&mtx);
+        seg_restantes = i;
+        pthread_mutex_unlock(&mtx);
+        sleep(1);
+    }
+
+    pthread_mutex_lock(&mtx);
+    estado = APOSTAS_FECHADAS;
+    struct aviator_msg msg = {0};
+    strncpy(msg.type, "closed", STR_LEN);
+    enviar_msg_para_todos(&msg);
+    printf("event=closed | id=*\n");
+
+    /* inicia voo */
+    voo_ativo = 1;
+    pthread_create(&tid_voo, NULL, thread_voo, NULL);
+    pthread_mutex_unlock(&mtx);
+
+    countdown_ativo = 0;
+    return NULL;
+}
+
+/* ---------- Thread voo ---------- */
 void *thread_voo(void *arg) {
-    pthread_mutex_lock(&controle_jogador);
-    estado_atual = EM_VOO;
-    pthread_mutex_unlock(&controle_jogador);
+    (void)arg;
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
 
-    float m = 1.0f;
+    pthread_mutex_lock(&mtx);
+    estado = EM_VOO;
+    double m = 1.0, V = 0.0;
     int N = 0;
-    float V = 0.0f;
-
-    pthread_mutex_lock(&controle_jogador);
-    for (int i = 0; i < max_jogadores; i++) {
+    for (int i = 0; i < MAX_JOGADORES; i++)
         if (jogador[i].csock != -1 && jogador[i].apostou) {
             N++;
             V += jogador[i].valor_aposta;
         }
-    }
-    pthread_mutex_unlock(&controle_jogador);
-
-    float m_e = sqrtf(1.0f + N + 0.01f * V);
+    const double m_e = sqrt(1.0 + N + 0.01 * V);
+    pthread_mutex_unlock(&mtx);
 
     struct aviator_msg msg;
-    memset(&msg, 0, sizeof(msg));
     strncpy(msg.type, "multiplier", STR_LEN);
-
-    printf("[log] Iniciando voo. Explosão ocorrerá em m = %.2f\n", m_e);
 
     while (m < m_e) {
         usleep(100000);
-        m *= 1.01f;
-        multiplicador_atual = m;
-
-        msg.value = m;
-        strncpy(msg.type, "multiplier", STR_LEN);
+        m *= 1.01;
+        pthread_mutex_lock(&mtx);
+        mult_atual = m;
+        msg.value  = (float)m;
         enviar_msg_para_todos(&msg);
+        pthread_mutex_unlock(&mtx);
+        printf("event=multiplier | id=* | m=%.2f\n", m);
     }
 
-    // Atualiza lucro da casa com apostas perdidas
-    pthread_mutex_lock(&controle_jogador);
-    for (int i = 0; i < max_jogadores; i++) {
-        if (jogador[i].csock != -1 && jogador[i].apostou && !jogador[i].cash) {
-            lucro_total_casa += jogador[i].valor_aposta;
+    /* explosão */
+    pthread_mutex_lock(&mtx);
+    for (int i = 0; i < MAX_JOGADORES; i++)
+        if (jogador[i].csock != -1 && jogador[i].apostou && !jogador[i].sacou) {
+            jogador[i].lucro -= jogador[i].valor_aposta;
+            lucro_casa       += jogador[i].valor_aposta;
+
+            struct aviator_msg lucro = {0};
+            strncpy(lucro.type, "profit", STR_LEN);
+            lucro.player_profit = (float)jogador[i].lucro;
+            send(jogador[i].csock, &lucro, sizeof(lucro), 0);
+
+            printf("event=explode | id=%d | m=%.2f\n", jogador[i].id, m);
+            printf("event=profit | id=%d | player_profit=%.2f\n",
+                   jogador[i].id, jogador[i].lucro);
         }
-    }
-    pthread_mutex_unlock(&controle_jogador);
 
     memset(&msg, 0, sizeof(msg));
     strncpy(msg.type, "explode", STR_LEN);
-    msg.value = m_e;
-    msg.house_profit = lucro_total_casa;
+    msg.value        = (float)m;
+    msg.house_profit = (float)lucro_casa;
     enviar_msg_para_todos(&msg);
+    printf("event=explode | id=* | m=%.2f\n", m);
+    printf("event=profit  | id=* | house_profit=%.2f\n", lucro_casa);
 
-    printf("[log] Avião explodiu em m = %.2f. Mensagem 'explode' enviada.\n", m_e);
+    resetar_apostas();
+    voo_ativo = 0;
+    if (num_jogadores > 0) iniciar_nova_rodada();
+    else estado = AGUARDANDO;
+    pthread_mutex_unlock(&mtx);
 
-    pthread_mutex_lock(&controle_jogador);
-    estado_atual = AGUARDANDO_JOGADORES;
-    pthread_mutex_unlock(&controle_jogador);
-
-    pthread_exit(NULL);
+    return NULL;
 }
 
-void *thread_countdown(void *arg) {
-    for (int i = 10; i > 0; i--) {
-        pthread_mutex_lock(&controle_jogador);
-        segundos_restantes = i;
-        pthread_mutex_unlock(&controle_jogador);
-        sleep(1);
-    }
-
-    pthread_mutex_lock(&controle_jogador);
-    estado_atual = APOSTAS_FECHADAS;
-    segundos_restantes = 0.0f;
-    pthread_mutex_unlock(&controle_jogador);
-
-    struct aviator_msg msg;
-    memset(&msg, 0, sizeof(msg));
-    strncpy(msg.type, "closed", STR_LEN);
+/* ---------- Inicia nova rodada ---------- */
+void iniciar_nova_rodada(void) {
+    estado        = APOSTAS_ABERTAS;
+    seg_restantes = 10.0;
+    struct aviator_msg msg = {0};
+    strncpy(msg.type, "start", STR_LEN);
+    msg.value = (float)seg_restantes;
     enviar_msg_para_todos(&msg);
-    printf("[log] Apostas encerradas. Mensagem 'closed' enviada.\n");
+    printf("event=start | id=* | N=%d\n", num_jogadores);
 
-    pthread_t tid_voo;
-    pthread_create(&tid_voo, NULL, thread_voo, NULL);
-    pthread_detach(tid_voo);
-
-    pthread_exit(NULL);
+    countdown_ativo = 1;
+    pthread_create(&tid_countdown, NULL, thread_countdown, NULL);
 }
 
-void *client_thread(void *data){
+/* ---------- Thread de cliente ---------- */
+void *client_thread(void *data) {
     struct client_data *cdata = (struct client_data *)data;
-    int slot = cdata->slot;
-    struct sockaddr *caddr = (struct sockaddr *)(&cdata->storage);
+    const int slot = cdata->slot;
+
     char caddrstr[BUFSZ];
-    addrtostr(caddr, caddrstr, BUFSZ);
-    printf("[log] connection from %s\n", caddrstr);
+    addrtostr((struct sockaddr *)&cdata->storage, caddrstr, BUFSZ);
+    printf("event=connect | id=%d | addr=%s\n", jogador[slot].id, caddrstr);
 
     while (1) {
         struct aviator_msg msg;
-        ssize_t count = recv(cdata->csock, &msg, sizeof(msg), 0);
-        if (count <= 0) break;
-
-        pthread_mutex_lock(&controle_jogador);
+        ssize_t cnt = recv(cdata->csock, &msg, sizeof(msg), 0);
+        if (cnt <= 0) break;
 
         if (strncmp(msg.type, "bet", STR_LEN) == 0) {
-            if (estado_atual != APOSTAS_ABERTAS) {
-                printf("[log] Aposta rejeitada: fora do tempo permitido.\n");
-            } else if (jogador[slot].apostou) {
-                printf("[log] Jogador %d já apostou nesta rodada.\n", jogador[slot].id_jogador);
-            } else {
+            pthread_mutex_lock(&mtx);
+            if (estado == APOSTAS_ABERTAS && !jogador[slot].apostou) {
                 jogador[slot].valor_aposta = msg.value;
-                jogador[slot].apostou = 1;
-                jogador[slot].cash = 0;
-                printf("[log] Aposta recebida de jogador %d: R$ %.2f\n",
-                       jogador[slot].id_jogador, msg.value);
+                jogador[slot].apostou      = 1;
+                int N = 0; double V = 0.0;
+                for (int i = 0; i < MAX_JOGADORES; i++)
+                    if (jogador[i].csock != -1 && jogador[i].apostou) {
+                        N++; V += jogador[i].valor_aposta;
+                    }
+                printf("event=bet | id=%d | bet=%.2f | N=%d | V=%.2f\n",
+                       jogador[slot].id, msg.value, N, V);
             }
+            pthread_mutex_unlock(&mtx);
         }
 
         else if (strncmp(msg.type, "cashout", STR_LEN) == 0) {
-            if (estado_atual == EM_VOO && jogador[slot].apostou && !jogador[slot].cash) {
-                jogador[slot].cash = 1;
-                float payout = jogador[slot].valor_aposta * multiplicador_atual;
-                jogador[slot].lucro_jogador = payout - jogador[slot].valor_aposta;
-                lucro_total_casa  = lucro_total_casa - (payout - jogador[slot].valor_aposta);
+            pthread_mutex_lock(&mtx);
+            if (estado == EM_VOO && jogador[slot].apostou && !jogador[slot].sacou) {
+                jogador[slot].sacou = 1;
+                double mult = floor(mult_atual * 100.0 + 0.5) / 100.0;
+                double pay  = jogador[slot].valor_aposta * mult;
+                jogador[slot].lucro += pay - jogador[slot].valor_aposta;
+                lucro_casa          -= (pay - jogador[slot].valor_aposta);
 
-                memset(&msg, 0, sizeof(msg));
-                strncpy(msg.type, "payout", STR_LEN);
-                msg.value = payout;
-                send(jogador[slot].csock, &msg, sizeof(msg), 0);
+                struct aviator_msg payout = {0};
+                strncpy(payout.type, "payout", STR_LEN);
+                payout.value        = (float)pay;
+                payout.player_profit= (float)mult;
+                send(jogador[slot].csock, &payout, sizeof(payout), 0);
+                printf("event=payout | id=%d | payout=%.2f\n", jogador[slot].id, pay);
 
-                memset(&msg, 0, sizeof(msg));
-                strncpy(msg.type, "profit", STR_LEN);
-                msg.player_profit = jogador[slot].lucro_jogador;
-                send(jogador[slot].csock, &msg, sizeof(msg), 0);
-
-                printf("[log] Jogador %d sacou com m = %.2f, payout = %.2f\n",
-                    jogador[slot].id_jogador, multiplicador_atual, payout);
+                struct aviator_msg lucro = {0};
+                strncpy(lucro.type, "profit", STR_LEN);
+                lucro.player_profit = (float)jogador[slot].lucro;
+                send(jogador[slot].csock, &lucro, sizeof(lucro), 0);
+                printf("event=profit | id=%d | player_profit=%.2f\n",
+                       jogador[slot].id, jogador[slot].lucro);
             }
+            pthread_mutex_unlock(&mtx);
         }
 
-        pthread_mutex_unlock(&controle_jogador);
+        else if (strncmp(msg.type, "bye", STR_LEN) == 0) break;
     }
 
-    pthread_mutex_lock(&controle_jogador);
+    /* desconexão */
+    pthread_mutex_lock(&mtx);
+    close(jogador[slot].csock);
     jogador[slot].csock = -1;
-    num_jogadores_conectados--;
-    pthread_mutex_unlock(&controle_jogador);
+    num_jogadores--;
+    printf("event=bye | id=%d\n", jogador[slot].id);
 
-    close(cdata->csock);
+    if (num_jogadores == 0)
+        encerrar_threads_rodada();
+    pthread_mutex_unlock(&mtx);
+
     free(cdata);
-    pthread_exit(EXIT_SUCCESS);
+    return NULL;
 }
 
-int main(int argc, char **argv){
+/* ---------- main ---------- */
+int main(int argc, char **argv) {
     if (argc < 3) usage(argc, argv);
 
-    srand(time(NULL));
-    memset(jogador, 0, sizeof(jogador));
-    for (int i = 0; i < max_jogadores; i++) jogador[i].csock = -1;
+    for (int i = 0; i < MAX_JOGADORES; i++) jogador[i].csock = -1;
 
     struct sockaddr_storage storage;
-    if (0 != server_sockaddr_init(argv[1], argv[2], &storage)) usage(argc, argv);
+    if (server_sockaddr_init(argv[1], argv[2], &storage)) usage(argc, argv);
 
-    int s = socket(storage.ss_family, SOCK_STREAM, 0);
-    if (s == -1) logexit("socket");
+    sock_listen = socket(storage.ss_family, SOCK_STREAM, 0);
+    if (sock_listen == -1) logexit("socket");
 
     int enable = 1;
-    if (0 != setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int))) logexit("setsockopt");
+    setsockopt(sock_listen, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
 
-    struct sockaddr *addr = (struct sockaddr *)(&storage);
-    if (0 != bind(s, addr, sizeof(storage))) logexit("bind");
-    if (0 != listen(s, 10)) logexit("listen");
+    if (bind(sock_listen, (struct sockaddr *)&storage, sizeof(storage))) logexit("bind");
+    if (listen(sock_listen, 10)) logexit("listen");
+
+    /* thread de teclado: encerra com Q */
+    pthread_create(&tid_teclado, NULL, thread_teclado, NULL);
 
     char addrstr[BUFSZ];
-    addrtostr(addr, addrstr, BUFSZ);
+    addrtostr((struct sockaddr *)&storage, addrstr, BUFSZ);
     printf("bound to %s, waiting connections...\n", addrstr);
 
-    while (1){
+    /* loop de accept */
+    while (1) {
         struct sockaddr_storage cstorage;
-        struct sockaddr *caddr = (struct sockaddr *)(&cstorage);
-        socklen_t caddrlen = sizeof(cstorage);
-        int csock = accept(s, caddr, &caddrlen);
-        if (csock == -1) logexit("accept");
-
-        pthread_mutex_lock(&controle_jogador);
-        int aux = -1;
-        for (int i = 0; i < max_jogadores; i++){
-            if (jogador[i].csock == -1){ aux = i; break; }
+        socklen_t len = sizeof(cstorage);
+        int csock = accept(sock_listen, (struct sockaddr *)&cstorage, &len);
+        if (csock == -1) {
+            /* se o socket foi fechado pelo shutdown, saímos do loop */
+            if (errno == EBADF) break;
+            logexit("accept");
         }
-        if (aux == -1){
-            pthread_mutex_unlock(&controle_jogador);
-            printf("[log] Máximo de jogadores atingido\n");
+
+        pthread_mutex_lock(&mtx);
+        int slot = -1;
+        for (int i = 0; i < MAX_JOGADORES; i++)
+            if (jogador[i].csock == -1) { slot = i; break; }
+        if (slot == -1) {
+            pthread_mutex_unlock(&mtx);
+            fprintf(stderr, "Máximo de jogadores atingido\n");
             close(csock);
             continue;
         }
 
-        jogador[aux].csock = csock;
-        jogador[aux].id_jogador = proximo_jogador_id++;
-        jogador[aux].apostou = 0;
-        jogador[aux].cash = 0;
-        jogador[aux].lucro_jogador = 0.0f;
-        jogador[aux].valor_aposta = 0.0f;
-        num_jogadores_conectados++;
+        jogador[slot].csock = csock;
+        jogador[slot].id    = proximo_id++;
+        jogador[slot].apostou = jogador[slot].sacou = 0;
+        jogador[slot].valor_aposta = jogador[slot].lucro = 0.0;
+        num_jogadores++;
 
-        struct aviator_msg msg;
-        memset(&msg, 0, sizeof(msg));
-        if (estado_atual == APOSTAS_ABERTAS) {
-            strncpy(msg.type, "start", STR_LEN);
-            msg.value = segundos_restantes > 0 ? segundos_restantes : 10.0f;
-            send(csock, &msg, sizeof(msg), 0);
-        } else if (estado_atual == APOSTAS_FECHADAS || estado_atual == EM_VOO) {
-            strncpy(msg.type, "closed", STR_LEN);
-            msg.value = 0.0f;
-            send(csock, &msg, sizeof(msg), 0);
-        }
-        pthread_mutex_unlock(&controle_jogador);
-
-        if (estado_atual == AGUARDANDO_JOGADORES && num_jogadores_conectados >= 1){
-            estado_atual = APOSTAS_ABERTAS;
-            segundos_restantes = 30.0f;
-            memset(&msg, 0, sizeof(msg));
-            strncpy(msg.type, "start", STR_LEN);
-            msg.value = segundos_restantes;
-            enviar_msg_para_todos(&msg);
-            printf("[log] Rodada iniciada. Enviando start a todos.\n");
-
-            pthread_t tid_countdown;
-            pthread_create(&tid_countdown, NULL, thread_countdown, NULL);
-            pthread_detach(tid_countdown);
+        /* envia estado atual */
+        if (estado == APOSTAS_ABERTAS || estado == APOSTAS_FECHADAS || estado == EM_VOO) {
+            struct aviator_msg init = {0};
+            if (estado == APOSTAS_ABERTAS) {
+                strncpy(init.type, "start", STR_LEN);
+                init.value = (float)seg_restantes;
+            } else {
+                strncpy(init.type, "closed", STR_LEN);
+            }
+            send(csock, &init, sizeof(init), 0);
         }
 
-        struct client_data *cdata = malloc(sizeof(*cdata));
-        if (!cdata) logexit("malloc");
-        cdata->csock = csock;
-        memcpy(&(cdata->storage), &cstorage, sizeof(cstorage));
-        cdata->slot = aux;
+        if (estado == AGUARDANDO)
+            iniciar_nova_rodada();
+        pthread_mutex_unlock(&mtx);
 
-        pthread_t tid;
-        pthread_create(&tid, NULL, client_thread, cdata);
-        pthread_detach(tid);
+        struct client_data *cd = malloc(sizeof(*cd));
+        cd->csock = csock; cd->slot = slot; memcpy(&cd->storage, &cstorage, sizeof(cstorage));
+        pthread_t tid; pthread_create(&tid, NULL, client_thread, cd); pthread_detach(tid);
     }
-
-    exit(EXIT_SUCCESS);
+    return 0;
 }
